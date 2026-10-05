@@ -426,7 +426,11 @@ def free_port():
 
 
 def ask(port, path, token=None, origin=None, form=None, method=None):
-    """One request; returns (status, headers, body)."""
+    """One request; returns (status, headers, body). Status 0: the server
+    closed the connection before an answer could be read whole. That is what
+    a refusal can look like from outside when an upload was on its way: the
+    server answers before it reads a request's body, and closing a
+    connection with unread data resets it (seen on Windows)."""
     headers = {}
     data = None
     if token:
@@ -449,7 +453,13 @@ def ask(port, path, token=None, origin=None, form=None, method=None):
         with opener.open(request, timeout=300) as response:
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as error:
-        return error.code, dict(error.headers), error.read()
+        try:
+            body = error.read()
+        except OSError:
+            body = b""
+        return error.code, dict(error.headers), body
+    except (urllib.error.URLError, OSError) as error:
+        return 0, {}, str(error).encode("utf-8", "replace")
 
 
 def smoke(folder, model, wav):
@@ -504,8 +514,14 @@ def smoke(folder, model, wav):
         ]:
             status, _, body = ask(port, "/health", **kwargs)
             check(f"{label}: /health is refused with 401", status == 401, f"HTTP {status}")
-            status, _, _ = ask(port, "/inference", form={"file": sound, "response_format": "json"}, **kwargs)
+            status, _, _ = ask(port, "/inference", form={"response_format": "json"}, **kwargs)
             check(f"{label}: /inference is refused with 401", status == 401, f"HTTP {status}")
+            # With a recording on its way the refusal comes before the upload
+            # is read: the 401, or the connection closed under the upload.
+            status, _, _ = ask(port, "/inference", form={"file": sound, "response_format": "json"}, **kwargs)
+            check(f"{label}: an upload to /inference is not taken (401, or the connection is closed)",
+                  status in (401, 0), "the connection was closed" if status == 0 else f"HTTP {status}")
+            check(f"{label}: the server is still running after it", server.poll() is None)
             status, _, _ = ask(port, "/", **kwargs)
             check(f"{label}: the server's own page is refused with 401", status == 401, f"HTTP {status}")
         status, _, _ = ask(port, "/health", token=token, origin=f"http://127.0.0.1:{port}")
