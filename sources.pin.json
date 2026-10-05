@@ -1,0 +1,17 @@
+{
+  "whisper": {
+    "version": "1.9.2",
+    "tag": "v1.9.2",
+    "url": "https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.9.2.tar.gz",
+    "file": "whisper.cpp-1.9.2.tar.gz",
+    "sha256": "a6abd064fcca8b85e794d205abf328c522e9451db43a3eadc178b883b7d0e9cd",
+    "bytes": 9622263
+  },
+  "vulkanSdk": {
+    "version": "1.4.363.0",
+    "url": "https://sdk.lunarg.com/sdk/download/1.4.363.0/windows/vulkansdk-windows-X64-1.4.363.0.exe",
+    "file": "vulkan-sdk-1.4.363.0-windows-x64.exe",
+    "sha256": "94a82d378f7a5e3e54c9db7d2fb7016af136e14ac0a18dbf0f2f67a36352d141",
+    "bytes": 303082720
+  }
+}
