@@ -9,10 +9,13 @@
         backends as loadable libraries (every CPU variant; Vulkan for the
         `vulkan` variant), gathers the program and the libraries it needs,
         checks what they depend on, starts the built server and checks that
-        it answers only its token, and writes
-        dist/whisper-runtime-<tag>-<variant>-x64.zip.
-    python build.py smoke --dir <folder> --model <ggml model> --wav <file>
-        Runs the same checks against a server that is already built.
+        it answers only its token and that a request's times are its own,
+        and writes dist/whisper-runtime-<tag>-<variant>-x64.zip.
+    python build.py smoke --dir <folder> --model <ggml model>
+                          --vad-model <ggml model> --wav <file>
+        Runs the same checks against a server that is already built. The
+        model must be a real one (the source's `for-tests` models say
+        nothing, and the check of the times needs words).
 
 Standard library only. `--cache <folder>` (pin and build) keeps the
 downloaded sources there and uses them when their hashes match.
@@ -20,6 +23,7 @@ downloaded sources there and uses them when their hashes match.
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import platform
@@ -33,6 +37,7 @@ import tarfile
 import time
 import urllib.error
 import urllib.request
+import wave
 import zipfile
 from pathlib import Path
 
@@ -240,7 +245,13 @@ def apply_patch(source):
             fail(f"the patched server.cpp does not hold {must!r}")
     if 'request_path + "/load"' in patched or "Access-Control-Allow-Origin" in patched:
         fail("the patched server.cpp still has /load or a cross-origin header")
-    say("PASS  the patch applied: token, Origin refusal, no /load, no cross-origin headers")
+    # Upstream clears the table once (inside whisper_vad); the patch adds a
+    # place for each of the two calls that can run without voice detection.
+    library = (source / "src" / "whisper.cpp").read_text(encoding="utf-8")
+    cleared = library.count("state->vad_mapping_table.clear();")
+    if library.count("[pbh]") != 2 or cleared < 4:
+        fail(f"the patched whisper.cpp does not clear the voice detection's time table in both calls ({cleared} place(s))")
+    say("PASS  the patch applied: token, Origin refusal, no /load, no cross-origin headers, no time table kept from an earlier request")
 
 
 def install_vulkan_sdk(entry, cache):
@@ -462,7 +473,27 @@ def ask(port, path, token=None, origin=None, form=None, method=None):
         return 0, {}, str(error).encode("utf-8", "replace")
 
 
-def smoke(folder, model, wav):
+def with_silence_before(sound, seconds):
+    """A WAV file's sound with `seconds` of silence put before it."""
+    with wave.open(io.BytesIO(sound)) as source:
+        shape = source.getparams()
+        frames = source.readframes(shape.nframes)
+    out = io.BytesIO()
+    with wave.open(out, "wb") as dest:
+        dest.setparams(shape)
+        dest.writeframes(b"\0" * (shape.framerate * shape.sampwidth * shape.nchannels * seconds) + frames)
+    return out.getvalue()
+
+
+def times_of(answer):
+    """A verbose_json answer's segments as (start, end), in seconds."""
+    try:
+        return [(float(s["start"]), float(s["end"])) for s in answer.get("segments", [])]
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return []
+
+
+def smoke(folder, model, wav, vad_model):
     """Starts the server in `folder` and checks the patch from outside."""
     exe = Path(folder) / EXE
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("GGML_", "WHISPER_")) and k != TOKEN_VARIABLE}
@@ -479,7 +510,8 @@ def smoke(folder, model, wav):
 
     # Without a token it does not start at all.
     port = free_port()
-    arguments = [str(exe), "--host", "127.0.0.1", "--port", str(port), "--model", str(model)]
+    arguments = [str(exe), "--host", "127.0.0.1", "--port", str(port), "--model", str(model),
+                 "--vad-model", str(vad_model)]
     bare = subprocess.run(arguments, env=env, cwd=folder, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=120)
     check("no token: the server refuses to start (exit code 4)", bare.returncode == 4, f"exit code {bare.returncode}")
     short = subprocess.run(arguments, env={**env, TOKEN_VARIABLE: "short"}, cwd=folder,
@@ -541,6 +573,48 @@ def smoke(folder, model, wav):
             pass
         check("the token: a recording is transcribed (verbose_json)",
               status == 200 and "segments" in answer and answer.get("duration", 0) > 0, f"HTTP {status}")
+
+        # A request's times are its own. Upstream keeps the time table of the
+        # last request that had voice detection on and maps the next request
+        # without it through that table. Asked here: a recording with 20
+        # seconds of silence before it and voice detection on (its table
+        # moves every time by about 20 seconds), then the recording itself
+        # with voice detection off, on the same server.
+        def heard(label, data, vad):
+            status, _, body = ask(port, "/inference", token=token,
+                                  form={"file": data, "response_format": "verbose_json",
+                                        "no_language_probabilities": "true", "vad": vad})
+            try:
+                got = json.loads(body)
+            except ValueError:
+                got = {}
+            if status != 200 or not isinstance(got, dict):
+                got = {}
+            times = times_of(got)
+            say(f"      {label}: HTTP {status}, {float(got.get('duration') or 0):.2f} s, segments "
+                + (", ".join(f"{a:.2f}-{b:.2f}" for a, b in times) or "none"))
+            return float(got.get("duration") or 0), times
+
+        lead = 20
+        try:
+            padded = with_silence_before(sound, lead)
+        except (wave.Error, EOFError) as error:
+            padded = None
+            check("the recording is a WAV file silence can be put before", False, str(error))
+        if padded is not None:
+            length, before = heard("voice detection off", sound, "false")
+            check("voice detection off: the model says words (a real model is needed for the checks of the times)",
+                  length > 0 and len(before) > 0, f"{len(before)} segment(s)")
+            _, shifted = heard(f"{lead} s of silence first, voice detection on", padded, "true")
+            check(f"voice detection on: the first segment starts after the silence ({lead - 5} s or later)",
+                  len(shifted) > 0 and shifted[0][0] >= lead - 5,
+                  f"it starts at {shifted[0][0]:.2f} s" if shifted else "no segment")
+            length, after = heard("voice detection off again", sound, "false")
+            inside = len(after) > 0 and all(a < length and b <= length + 1.0 for a, b in after)
+            check("then voice detection off on the same server: every segment lies inside its own recording",
+                  inside, (f"the last one starts at {after[-1][0]:.2f} s of {length:.2f} s" if after else "no segment"))
+            say(f"      the same request before and after: {'the same times' if before == after else 'DIFFERENT times'}")
+
         status, _, _ = ask(port, "/inference", token=token, form={"file": b"not a recording", "response_format": "json"})
         check("the token: a file that is no recording is refused with 400", status == 400, f"HTTP {status}")
         status, _, _ = ask(port, "/health", token=token)
@@ -558,7 +632,8 @@ def smoke(folder, model, wav):
 
 
 def cmd_smoke(args):
-    problems = smoke(Path(args.dir).resolve(), Path(args.model).resolve(), Path(args.wav).resolve())
+    problems = smoke(Path(args.dir).resolve(), Path(args.model).resolve(), Path(args.wav).resolve(),
+                     Path(args.vad_model).resolve())
     if problems:
         fail(f"{len(problems)} check(s) failed")
     say("SMOKE: PASS")
@@ -705,7 +780,10 @@ def cmd_build(args):
     write_licenses(source, stage / "licenses", report["runtime"])
 
     say("== the built server, asked")
-    problems = smoke(stage, source / "models" / "for-tests-ggml-tiny.bin", source / "samples" / "jfk.wav")
+    # A real model, so the answers have words and times: never packaged.
+    model = obtain(pin["testModel"], cache)
+    problems = smoke(stage, model, source / "samples" / "jfk.wav",
+                     source / "models" / "for-tests-silero-v6.2.0-ggml.bin")
     if problems:
         fail(f"{len(problems)} check(s) of the built server failed")
 
@@ -722,6 +800,7 @@ def cmd_build(args):
         "whisper": {k: pin["whisper"][k] for k in ("version", "tag", "url", "sha256")},
         "patch": {"file": "patches/whisper-server.patch", "sha256": sha256(PATCH)},
         "vulkanSdk": ({k: pin["vulkanSdk"][k] for k in ("version", "url", "sha256")} if variant == "vulkan" else None),
+        "testModel": {k: pin["testModel"][k] for k in ("url", "sha256")},
         "cmakeOptions": options,
         "compiler": compiler,
         "commit": os.environ.get("GITHUB_SHA", ""),
@@ -756,7 +835,8 @@ def main():
     build.set_defaults(run=cmd_build)
     check = commands.add_parser("smoke")
     check.add_argument("--dir", required=True)
-    check.add_argument("--model", required=True)
+    check.add_argument("--model", required=True, help="a real ggml model, e.g. ggml-tiny.bin")
+    check.add_argument("--vad-model", required=True, help="the voice detection's ggml model")
     check.add_argument("--wav", required=True)
     check.set_defaults(run=cmd_smoke)
     args = parser.parse_args()

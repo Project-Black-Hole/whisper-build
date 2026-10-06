@@ -5,7 +5,8 @@ Builds [whisper.cpp](https://github.com/ggml-org/whisper.cpp)'s
 patch, as a package another program can start and talk to on this computer.
 
 - `sources.pin.json` names the exact sources: whisper.cpp's source archive,
-  and the Vulkan SDK the shaders are compiled with, each with its SHA-256.
+  the Vulkan SDK the shaders are compiled with, and the small model the
+  built server is asked with (it is never packaged), each with its SHA-256.
 - `patches/whisper-server.patch` is the one change to the source (below).
 - `build.py build` checks every source against its hash, applies the patch
   (it must apply exactly), and builds the server with ggml's backends as
@@ -43,9 +44,23 @@ it:
   `[pbh] listening on <host>:<port>`, so the program that started it can
   tell its own server from anything else on that port.
 
+It also mends one fault of the library itself (`src/whisper.cpp`):
+
+- **A request's times are its own.** Upstream keeps the time table of the
+  last request that had voice detection on, and clears it only when the
+  next request has voice detection on too. A request without voice
+  detection that followed one with it had its segments' times mapped
+  through the earlier recording's table: late by however much silence that
+  recording had lost, and past the end of its own sound. The patch clears
+  the table, the detected stretches and their flag at the start of every
+  request without voice detection.
+
 Every changed place is marked `[pbh]` in the source. `build.py` refuses a
 patch that does not apply exactly, and checks each of the points above
-against the built server before it writes an archive.
+against the built server before it writes an archive: for the last one it
+asks the server for a recording with 20 seconds of silence before it and
+voice detection on, then for the recording itself with voice detection off,
+and wants every segment of the second answer inside its own recording.
 
 ## Moving a pin
 

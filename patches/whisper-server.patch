@@ -147,3 +147,33 @@
      // Set the base directory for serving static files
      svr->set_base_dir(sparams.public_path);
  
+--- a/src/whisper.cpp
++++ b/src/whisper.cpp
+@@ -7788,6 +7788,14 @@
+         }
+         samples = vad_samples.data();
+         n_samples = vad_samples.size();
++    } else {
++        // [pbh] Without voice detection nothing of an earlier call's may
++        // stay: upstream clears its time table only inside whisper_vad(), so
++        // a call without voice detection that follows one with it had its
++        // segments' times mapped through the earlier recording's table.
++        ctx->state->has_vad_segments = false;
++        ctx->state->vad_mapping_table.clear();
++        ctx->state->vad_segments.clear();
+     }
+     return whisper_full_with_state(ctx, ctx->state, params, samples, n_samples);
+ }
+@@ -7815,6 +7823,12 @@
+         }
+         samples = vad_samples.data();
+         n_samples = vad_samples.size();
++    } else {
++        // [pbh] As in whisper_full(): nothing of an earlier call's voice
++        // detection stays for a call without it.
++        ctx->state->has_vad_segments = false;
++        ctx->state->vad_mapping_table.clear();
++        ctx->state->vad_segments.clear();
+     }
+     int ret = 0;
+ 
