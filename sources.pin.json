@@ -1,11 +1,11 @@
 {
   "whisper": {
-    "version": "1.9.2",
-    "tag": "v1.9.2",
-    "url": "https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.9.2.tar.gz",
-    "file": "whisper.cpp-1.9.2.tar.gz",
-    "sha256": "a6abd064fcca8b85e794d205abf328c522e9451db43a3eadc178b883b7d0e9cd",
-    "bytes": 9622263
+    "version": "1.9.5",
+    "tag": "v1.9.5",
+    "url": "https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.9.5.tar.gz",
+    "file": "whisper.cpp-1.9.5.tar.gz",
+    "sha256": "ff1a9053feb509ff9d7729703355541ae9690073a6b1c40eb692c962e0dc1720",
+    "bytes": 9626464
   },
   "vulkanSdk": {
     "version": "1.4.363.0",
