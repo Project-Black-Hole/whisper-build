@@ -46,6 +46,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import socket
 import struct
 import subprocess
@@ -1132,7 +1133,9 @@ def write_zip(stage, dest):
             info.compress_type = zipfile.ZIP_DEFLATED
             if MACOS:
                 info.create_system = 3
-            info.external_attr = (0o755 if path.name == EXE else 0o644) << 16
+            # The file's type with its mode: macOS's ditto drops a mode that
+            # has no type (1.9.5-2's server came out not runnable).
+            info.external_attr = (stat.S_IFREG | (0o755 if path.name == EXE else 0o644)) << 16
             archive.writestr(info, path.read_bytes(), compresslevel=9)
 
 
