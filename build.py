@@ -3,22 +3,39 @@
 
     python build.py pin --whisper <tag> [--vulkan-sdk <version>|latest]
         Downloads the sources, hashes them and writes sources.pin.json.
-    python build.py build [--variant vulkan|cpu] [--tag <tag>]
+    python build.py build [--variant vulkan|metal|cpu] [--tag <tag>]
+                          [--unfixed-library]
         Checks every source against its SHA-256, applies
         patches/whisper-server.patch, builds `whisper-server` with ggml's
         backends as loadable libraries (every CPU variant; Vulkan for the
-        `vulkan` variant), gathers the program and the libraries it needs,
-        checks what they depend on, starts the built server and checks that
-        it answers only its token and that a request's times are its own,
-        and writes dist/whisper-runtime-<tag>-<variant>-x64.zip.
+        `vulkan` variant on Windows x64, Metal and Accelerate for the `metal`
+        variant on macOS arm64), gathers the program and the libraries it
+        needs, checks what they depend on, writes the archive, unpacks it
+        into a fresh folder and starts the server from there: it must answer
+        only its token, a request's times must be its own, and every word of
+        an answer must carry its times inside its segment. The archive is
+        dist/whisper-runtime-<tag>-<variant>-<platform>.zip (Windows keeps
+        its old name, whisper-runtime-<tag>-vulkan-x64.zip).
+        --unfixed-library: a check build, never released. The patch's server
+        part only (its src/whisper.cpp part is left out), written as
+        dist/whisper-check-<tag>-<variant>-unfixed-<platform>.zip; it passes
+        only when the check of the times fails and every other check passes.
     python build.py smoke --dir <folder> --model <ggml model>
                           --vad-model <ggml model> --wav <file>
+                          [--want-gpu metal|vulkan] [--expect-times-fault]
         Runs the same checks against a server that is already built. The
         model must be a real one (the source's `for-tests` models say
-        nothing, and the check of the times needs words).
+        nothing, and the checks of the times need words). --want-gpu makes
+        "the server uses that GPU" a check. --expect-times-fault: as for a
+        check build; exit code 3 when the times are right after all (every
+        other check passed), so a caller can say the fault is not there.
+    python build.py bench --dir <folder> --model <ggml model>
+                          --vad-model <ggml model> --wav <file> [--no-gpu]
+        One request of the app's own form, timed; a report, no check.
 
-Standard library only. `--cache <folder>` (pin and build) keeps the
-downloaded sources there and uses them when their hashes match.
+Standard library only; runs on Python 3.9 (the Mac's own python3).
+`--cache <folder>` (pin and build) keeps the downloaded sources there and
+uses them when their hashes match.
 """
 
 import argparse
@@ -47,8 +64,12 @@ PATCH = ROOT / "patches" / "whisper-server.patch"
 WORK = ROOT / "work"
 DIST = ROOT / "dist"
 WINDOWS = os.name == "nt"
+MACOS = sys.platform == "darwin"
 EXE = "whisper-server.exe" if WINDOWS else "whisper-server"
 TOKEN_VARIABLE = "PBH_WHISPER_TOKEN"
+# The patch's part in the library itself (the fix of the times); a check
+# build leaves it out.
+LIBRARY_FILE = "src/whisper.cpp"
 
 # The Visual C++ runtime's libraries: never taken from the system folder of
 # the machine that builds, always from the compiler's own redistributable
@@ -72,6 +93,40 @@ CMAKE_OPTIONS = [
     "-DWHISPER_SDL2=OFF",
     "-DWHISPER_CURL=OFF",
 ]
+
+# macOS (arm64 only): Metal with its shaders embedded as source (the Mac's
+# Metal framework compiles them at the server's first start), Accelerate as
+# ggml's BLAS, no OpenMP (Apple's clang has none; a Homebrew libomp would tie
+# the package to /opt/homebrew), and every file finds the others beside it.
+# CMAKE_BUILD_WITH_INSTALL_RPATH: the build's own run paths would otherwise
+# carry the build folders' absolute paths besides @loader_path.
+MACOS_DEPLOYMENT_TARGET = "13.3"
+MACOS_OPTIONS = [
+    "-DGGML_METAL=ON",
+    "-DGGML_METAL_EMBED_LIBRARY=ON",
+    "-DGGML_BLAS=ON",
+    "-DGGML_BLAS_VENDOR=Apple",
+    "-DGGML_OPENMP=OFF",
+    "-DWHISPER_COREML=OFF",
+    "-DCMAKE_OSX_ARCHITECTURES=arm64",
+    f"-DCMAKE_OSX_DEPLOYMENT_TARGET={MACOS_DEPLOYMENT_TARGET}",
+    "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON",
+    "-DCMAKE_INSTALL_RPATH=@loader_path",
+]
+# Frameworks only the Metal backend may link, so a Mac whose Metal fails
+# still starts the server on its CPU.
+METAL_ONLY = ("Metal.framework", "MetalKit.framework")
+METAL_MODULE = "libggml-metal.so"
+
+# What the GPU line of the server's log says for each backend.
+GPU_LINE = {
+    "metal": re.compile(r"^whisper_backend_init_gpu: using MTL\d+ backend"),
+    "vulkan": re.compile(r"^whisper_backend_init_gpu: using Vulkan\d+ backend"),
+}
+TIMES_LABEL = "then voice detection off on the same server: every segment lies inside its own recording"
+# How far a word's times may lie outside its segment's (seconds): the two are
+# mapped back through voice detection by different functions.
+WORD_TOLERANCE = 0.25
 
 
 def say(text=""):
@@ -234,13 +289,20 @@ def run(command, env=None, cwd=None):
         fail(f"{Path(str(command[0])).name} ended with {result.returncode}")
 
 
-def apply_patch(source):
+def apply_patch(source, unfixed=False):
     """The patch must apply whole and exactly: `git apply` refuses a hunk
-    that does not match, with no fuzz."""
-    run(["git", "apply", "--check", "--verbose", PATCH], cwd=source)
-    run(["git", "apply", "--verbose", PATCH], cwd=source)
+    that does not match, with no fuzz. A check build applies its server part
+    only: the library's part is left out here, the file is not split."""
+    leave_out = ["--exclude", LIBRARY_FILE] if unfixed else []
+    # Git must not see the repository this script sits in (a checkout, on the
+    # runners): inside one, `git apply` takes the patch's paths from the
+    # repository's top and `--exclude` matches nothing.
+    env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(Path(source).resolve().parent))
+    run(["git", "apply", "--check", "--verbose"] + leave_out + [PATCH], env=env, cwd=source)
+    run(["git", "apply", "--verbose"] + leave_out + [PATCH], env=env, cwd=source)
     patched = (source / "examples" / "server" / "server.cpp").read_text(encoding="utf-8")
-    for must in (TOKEN_VARIABLE, "set_pre_routing_handler", "[pbh] listening on"):
+    for must in (TOKEN_VARIABLE, "set_pre_routing_handler", "[pbh] listening on",
+                 "whisper_full_get_token_t0(ctx, i, word_j0)", "whisper_full_get_token_t1(ctx, i, word_j1)"):
         if must not in patched:
             fail(f"the patched server.cpp does not hold {must!r}")
     if 'request_path + "/load"' in patched or "Access-Control-Allow-Origin" in patched:
@@ -249,9 +311,14 @@ def apply_patch(source):
     # place for each of the two calls that can run without voice detection.
     library = (source / "src" / "whisper.cpp").read_text(encoding="utf-8")
     cleared = library.count("state->vad_mapping_table.clear();")
+    if unfixed:
+        if library.count("[pbh]") != 0:
+            fail("the check build's whisper.cpp holds a [pbh] place: the library's part was applied")
+        say(f"PASS  the patch's server part applied; the library is upstream's ({cleared} place(s) clear the time table): a check build")
+        return
     if library.count("[pbh]") != 2 or cleared < 4:
         fail(f"the patched whisper.cpp does not clear the voice detection's time table in both calls ({cleared} place(s))")
-    say("PASS  the patch applied: token, Origin refusal, no /load, no cross-origin headers, no time table kept from an earlier request")
+    say("PASS  the patch applied: token, Origin refusal, no /load, no cross-origin headers, words' times mapped to the recording, no time table kept from an earlier request")
 
 
 def install_vulkan_sdk(entry, cache):
@@ -428,6 +495,199 @@ def gather_unix(bin_dir, stage):
     return {"built": names, "runtime": [], "system": [], "vulkanLoader": []}
 
 
+# ---- What a macOS program or library needs (otool, lipo, codesign) ----
+# The parsers read the tools' text and nothing else, so they can be tried
+# against recorded outputs where there is no Mac.
+
+def macho_tool(arguments):
+    """(exit code, standard output and error) of one of Xcode's tools."""
+    result = subprocess.run([str(a) for a in arguments], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return result.returncode, result.stdout.decode("utf-8", "replace")
+
+
+def parse_install_name(text):
+    """`otool -D <file>`: a library's own install name, or None (a program or
+    a loadable bundle has none)."""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if len(lines) >= 2 and not lines[1].endswith(":"):
+        return lines[1]
+    return None
+
+
+def parse_linked(text, own=None):
+    """`otool -L <file>`: the libraries it links, its own install name left
+    out (a library lists itself first)."""
+    linked = []
+    for line in text.splitlines()[1:]:
+        found = re.match(r"^\s+(\S.*?) \(compatibility version [^)]*\)\s*$", line)
+        if found and found.group(1) != own:
+            linked.append(found.group(1))
+    return linked
+
+
+def parse_rpaths(text):
+    """`otool -l <file>`: every LC_RPATH's path."""
+    paths = []
+    command = None
+    for line in text.splitlines():
+        words = line.split()
+        if len(words) >= 2 and words[0] == "cmd":
+            command = words[1]
+        elif command == "LC_RPATH" and len(words) >= 2 and words[0] == "path":
+            paths.append(re.sub(r"\s+\(offset \d+\)\s*$", "", line.strip()[len("path"):].strip()))
+    return paths
+
+
+def parse_minos(text):
+    """`otool -l <file>`: the lowest macOS it runs on (LC_BUILD_VERSION's
+    minos, or LC_VERSION_MIN_MACOSX's version), or None."""
+    command = None
+    for line in text.splitlines():
+        words = line.split()
+        if len(words) >= 2 and words[0] == "cmd":
+            command = words[1]
+        elif command == "LC_BUILD_VERSION" and len(words) >= 2 and words[0] == "minos":
+            return words[1]
+        elif command == "LC_VERSION_MIN_MACOSX" and len(words) >= 2 and words[0] == "version":
+            return words[1]
+    return None
+
+
+def version_tuple(text):
+    return tuple(int(n) for n in re.findall(r"\d+", text or ""))
+
+
+def macho_kind(name):
+    """How a file of the build is told apart: the program, a loadable
+    backend (CMake writes a MODULE as .so on macOS too, and ggml looks for
+    libggml-<name>-*.so beside the program), or a library."""
+    if name == EXE:
+        return "program"
+    if name.endswith(".so"):
+        return "module"
+    if name.endswith(".dylib"):
+        return "library"
+    return None
+
+
+def gather_macos(bin_dir, stage, variant, tool=macho_tool):
+    """Copies the server, every backend of the build and what they link into
+    `stage`, flat, each library under the name its install name uses (a
+    symbolic link resolved to its file). Every dependency is accounted for:
+    a file of the package by @rpath or @loader_path, or a part of macOS
+    (/usr/lib/, /System/Library/). Every file: arm64 only, run paths
+    @loader_path only, its lowest macOS at or below the deployment target,
+    and the linker's own signature verified (nothing changes a file after
+    linking). Only the Metal backend may link Metal. `tool` runs otool,
+    lipo and codesign (tests give it recorded outputs)."""
+    def ask_tool(arguments, label):
+        code, out = tool(arguments)
+        if code != 0:
+            fail(f"{label} ended with {code}: {out.strip()[:400]}")
+        return out
+
+    files = {}
+    for path in sorted(bin_dir.iterdir()):
+        kind = macho_kind(path.name)
+        if kind is None or path.is_dir():
+            continue
+        real = path.resolve()
+        if kind == "library":
+            own = parse_install_name(ask_tool(["otool", "-D", real], f"otool -D {path.name}"))
+            if not own:
+                fail(f"{path.name} has no install name")
+            name = own.rsplit("/", 1)[-1]
+        else:
+            own = None
+            name = path.name
+        if name in files and files[name][0] != real:
+            fail(f"two files of the build would both be {name}: {files[name][0].name} and {real.name}")
+        files[name] = (real, own, kind)
+    if EXE not in files:
+        fail(f"{EXE} is not in {bin_dir}")
+    modules = sorted(n for n, (_, _, kind) in files.items() if kind == "module" and n.startswith("libggml-"))
+    if variant == "metal" and METAL_MODULE not in modules:
+        fail(f"the build made no {METAL_MODULE}")
+    if not any(n.startswith("libggml-cpu-apple_") for n in modules):
+        fail("the build made no libggml-cpu-apple_*.so")
+    if "libggml-vulkan.so" in modules:
+        fail("a macOS build made a Vulkan backend")
+
+    per_file = {}
+    queue = [EXE] + modules
+    seen = set()
+    while queue:
+        name = queue.pop(0)
+        if name in seen:
+            continue
+        seen.add(name)
+        real, own, _ = files[name]
+        shutil.copy2(real, stage / name)
+        mine = {"built": [], "system": [], "frameworks": []}
+        for needed in parse_linked(ask_tool(["otool", "-L", real], f"otool -L {name}"), own):
+            if needed.startswith("@rpath/") or needed.startswith("@loader_path/"):
+                leaf = needed.split("/", 1)[1]
+                if leaf not in files:
+                    fail(f"{name} links {needed}, which is not a file of the build")
+                mine["built"].append(leaf)
+                queue.append(leaf)
+            elif needed.startswith("/System/Library/Frameworks/"):
+                framework = needed.split("/")[4]
+                if framework in METAL_ONLY and name != METAL_MODULE:
+                    fail(f"{name} links {framework}: only {METAL_MODULE} may, or a Mac whose Metal fails can't start the server")
+                mine["frameworks"].append(framework)
+            elif needed.startswith("/usr/lib/") or needed.startswith("/System/Library/"):
+                mine["system"].append(needed)
+            else:
+                fail(f"{name} links {needed}: neither a file of the package nor a part of macOS")
+        per_file[name] = {key: sorted(set(value)) for key, value in mine.items()}
+
+    target = version_tuple(MACOS_DEPLOYMENT_TARGET)
+    for name in sorted(seen):
+        path = stage / name
+        archs = ask_tool(["lipo", "-archs", path], f"lipo -archs {name}").split()
+        if archs != ["arm64"]:
+            fail(f"{name} is not arm64 only ({' '.join(archs) or 'nothing'})")
+        commands = ask_tool(["otool", "-l", path], f"otool -l {name}")
+        rpaths = parse_rpaths(commands)
+        if any(p != "@loader_path" for p in rpaths):
+            fail(f"{name} has a run path other than @loader_path: {', '.join(rpaths)}")
+        minos = parse_minos(commands)
+        if not minos or version_tuple(minos) > target:
+            fail(f"{name} needs macOS {minos or '(not said)'}, above {MACOS_DEPLOYMENT_TARGET}")
+        code, out = tool(["codesign", "--verify", "--strict", path])
+        if code != 0:
+            fail(f"{name}: codesign --verify --strict ended with {code}: {out.strip()[:400]}")
+    report = {
+        "built": sorted(seen),
+        "system": sorted({s for f in per_file.values() for s in f["system"]}),
+        "frameworks": sorted({s for f in per_file.values() for s in f["frameworks"]}),
+        "perFile": per_file,
+    }
+    if variant == "metal" and not any(f in METAL_ONLY for f in per_file.get(METAL_MODULE, {}).get("frameworks", [])):
+        fail(f"{METAL_MODULE} does not link Metal: is it a Metal build?")
+    say(f"PASS  gathered {len(report['built'])} file(s); every one arm64 only, run path @loader_path, macOS {MACOS_DEPLOYMENT_TARGET} or older, its signature verified")
+    say(f"      built: {', '.join(report['built'])}")
+    say(f"      parts of macOS they use: {', '.join(report['system'])}")
+    say(f"      frameworks: {', '.join(report['frameworks'])}")
+    return report
+
+
+def xcode_report():
+    """What compiled the macOS build: Xcode's version, its SDK and clang
+    (recorded, not pinned, as the Windows build records its compiler)."""
+    found = {}
+    for key, arguments in (("xcode", ["xcodebuild", "-version"]),
+                           ("sdk", ["xcrun", "--show-sdk-version"]),
+                           ("clang", ["xcrun", "clang", "--version"])):
+        try:
+            code, out = macho_tool(arguments)
+        except OSError as error:
+            code, out = 1, str(error)
+        found[key] = " ".join(out.split()) if code == 0 else f"(not read: {out.strip()[:200]})"
+    return found
+
+
 # ---- The built server, asked ----
 
 def free_port():
@@ -461,7 +721,7 @@ def ask(port, path, token=None, origin=None, form=None, method=None):
     request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data, headers=headers, method=method)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(request, timeout=300) as response:
+        with opener.open(request, timeout=900) as response:
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as error:
         try:
@@ -471,6 +731,14 @@ def ask(port, path, token=None, origin=None, form=None, method=None):
         return error.code, dict(error.headers), body
     except (urllib.error.URLError, OSError) as error:
         return 0, {}, str(error).encode("utf-8", "replace")
+
+
+def app_form(sound, vad):
+    """The form the app sends for one part (crates/app-providers/src/
+    whisper.rs, form_fields), with no prompt: what B2's LAN server will be
+    asked too."""
+    return {"file": sound, "response_format": "verbose_json", "no_language_probabilities": "true",
+            "language": "auto", "translate": "false", "vad": "true" if vad else "false"}
 
 
 def with_silence_before(sound, seconds):
@@ -493,12 +761,73 @@ def times_of(answer):
         return []
 
 
-def smoke(folder, model, wav, vad_model):
+def check_words(answer, tolerance=WORD_TOLERANCE):
+    """Every segment of a verbose_json answer carries words, each with a
+    start no later than its end, inside its segment (give or take
+    `tolerance` seconds). Returns (ok, what was found)."""
+    segments = answer.get("segments") if isinstance(answer, dict) else None
+    if not isinstance(segments, list) or not segments:
+        return False, "no segment"
+    words = 0
+    worst = 0.0
+    for index, segment in enumerate(segments, 1):
+        try:
+            start, end = float(segment["start"]), float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            return False, f"segment {index} has no times"
+        listed = segment.get("words")
+        if not isinstance(listed, list) or not listed:
+            return False, f"segment {index} ({start:.2f}-{end:.2f} s) has no words"
+        for word in listed:
+            try:
+                w0, w1 = float(word["start"]), float(word["end"])
+            except (KeyError, TypeError, ValueError):
+                return False, f"a word of segment {index} has no times ({str(word)[:80]})"
+            if w0 > w1:
+                return False, f"a word of segment {index} starts after it ends ({w0:.2f} > {w1:.2f} s)"
+            outside = max(start - w0, w1 - end, 0.0)
+            worst = max(worst, outside)
+            if outside > tolerance:
+                return False, (f"a word of segment {index} ({start:.2f}-{end:.2f} s) lies at {w0:.2f}-{w1:.2f} s, "
+                               f"{outside:.2f} s outside it")
+            words += 1
+    return True, f"{len(segments)} segment(s), {words} word(s), the farthest {worst:.2f} s outside its segment"
+
+
+def server_env(folder):
+    """The environment the server starts in: no GGML_ or WHISPER_ variable,
+    no token, and on macOS no DYLD_ variable (the package must find its
+    libraries by @loader_path alone)."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.upper().startswith(("GGML_", "WHISPER_", "DYLD_")) and k != TOKEN_VARIABLE}
+    if not WINDOWS and not MACOS:
+        env["LD_LIBRARY_PATH"] = str(folder)
+    return env
+
+
+def wait_listening(server, log, port, seconds=180):
+    line = f"[pbh] listening on 127.0.0.1:{port}"
+    deadline = time.time() + seconds
+    while time.time() < deadline and server.poll() is None:
+        if line in log.read_text(encoding="utf-8", errors="replace"):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def report_log(text):
+    """The lines of the server's log that say which backends it loaded and
+    which device it uses."""
+    for wanted in ("whisper_backend_init_gpu:", "load_backend:", "ggml_metal"):
+        hits = [l for l in text.splitlines() if l.startswith(wanted) or (wanted == "ggml_metal" and wanted in l)]
+        for hit in hits[:12]:
+            say(f"      {hit}")
+
+
+def smoke(folder, model, wav, vad_model, want_gpu=None):
     """Starts the server in `folder` and checks the patch from outside."""
     exe = Path(folder) / EXE
-    env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("GGML_", "WHISPER_")) and k != TOKEN_VARIABLE}
-    if not WINDOWS:
-        env["LD_LIBRARY_PATH"] = str(folder)
+    env = server_env(folder)
     log = WORK / "smoke-stderr.txt"
     log.parent.mkdir(parents=True, exist_ok=True)
     problems = []
@@ -523,14 +852,7 @@ def smoke(folder, model, wav, vad_model):
         server = subprocess.Popen(arguments, env={**env, TOKEN_VARIABLE: token}, cwd=folder,
                                   stdout=subprocess.DEVNULL, stderr=err)
     try:
-        line = f"[pbh] listening on 127.0.0.1:{port}"
-        deadline = time.time() + 180
-        up = False
-        while time.time() < deadline and server.poll() is None:
-            if line in log.read_text(encoding="utf-8", errors="replace"):
-                up = True
-                break
-            time.sleep(0.2)
+        up = wait_listening(server, log, port)
         check("the server says on standard error that it holds the port", up)
         if not up:
             say(log.read_text(encoding="utf-8", errors="replace")[-3000:])
@@ -611,9 +933,22 @@ def smoke(folder, model, wav, vad_model):
                   f"it starts at {shifted[0][0]:.2f} s" if shifted else "no segment")
             length, after = heard("voice detection off again", sound, "false")
             inside = len(after) > 0 and all(a < length and b <= length + 1.0 for a, b in after)
-            check("then voice detection off on the same server: every segment lies inside its own recording",
-                  inside, (f"the last one starts at {after[-1][0]:.2f} s of {length:.2f} s" if after else "no segment"))
+            check(TIMES_LABEL, inside,
+                  (f"the last one starts at {after[-1][0]:.2f} s of {length:.2f} s" if after else "no segment"))
             say(f"      the same request before and after: {'the same times' if before == after else 'DIFFERENT times'}")
+
+            # Each word's times, asked with the app's own form (what speaker
+            # labels need from any engine, decision 911(b)): the recording as
+            # it is, and with the silence first, voice detection on both.
+            for label, data in (("the recording", sound), (f"{lead} s of silence first", padded)):
+                status, _, body = ask(port, "/inference", token=token, form=app_form(data, True))
+                try:
+                    got = json.loads(body)
+                except ValueError:
+                    got = {}
+                ok, detail = check_words(got) if status == 200 else (False, f"HTTP {status}")
+                check(f"the app's form, {label}, voice detection on: every segment carries words, each inside its segment",
+                      ok, detail)
 
         status, _, _ = ask(port, "/inference", token=token, form={"file": b"not a recording", "response_format": "json"})
         check("the token: a file that is no recording is refused with 400", status == 400, f"HTTP {status}")
@@ -621,10 +956,14 @@ def smoke(folder, model, wav, vad_model):
         check("the server still answers at the end", status == 200, f"HTTP {status}")
         text = log.read_text(encoding="utf-8", errors="replace")
         check("the token is not in the server's log", token not in text)
-        for wanted in ("whisper_backend_init_gpu:", "load_backend:"):
-            hits = [l for l in text.splitlines() if l.startswith(wanted)]
-            for hit in hits[:12]:
-                say(f"      {hit}")
+        report_log(text)
+        if want_gpu:
+            used = [l for l in text.splitlines() if GPU_LINE[want_gpu].match(l)]
+            broken = [l for l in text.splitlines() if l.startswith("whisper_backend_init_gpu: failed")]
+            check(f"the server uses the {want_gpu} GPU", bool(used) and not broken,
+                  (used[0] if used else "no line says so") + ("; " + broken[0] if broken else ""))
+        else:
+            say("      (the GPU in use is a report here, not a check)")
     finally:
         server.kill()
         server.wait()
@@ -633,10 +972,66 @@ def smoke(folder, model, wav, vad_model):
 
 def cmd_smoke(args):
     problems = smoke(Path(args.dir).resolve(), Path(args.model).resolve(), Path(args.wav).resolve(),
-                     Path(args.vad_model).resolve())
+                     Path(args.vad_model).resolve(), args.want_gpu)
+    verdict(problems, args.expect_times_fault, "SMOKE")
+
+
+def verdict(problems, expect_times_fault, word):
+    """A check build passes only when the check of the times is the one
+    that failed; exit code 3 when nothing failed (the fault is not there)."""
+    if expect_times_fault:
+        if problems == [TIMES_LABEL]:
+            say(f"{word}: PASS (the check of the times fails without the library's fix, and only it, as expected)")
+            return
+        if not problems:
+            say(f"{word}: TIMES FAULT NOT THERE (every check passed without the library's fix)")
+            sys.exit(3)
+        fail(f"{len(problems)} check(s) failed: {'; '.join(problems)}")
     if problems:
         fail(f"{len(problems)} check(s) failed")
-    say("SMOKE: PASS")
+    say(f"{word}: PASS")
+
+
+def cmd_bench(args):
+    """One request of the app's form on a server started as the app starts
+    it, timed from the upload to the answer. A report."""
+    folder = Path(args.dir).resolve()
+    port = free_port()
+    token = hashlib.sha256(os.urandom(32)).hexdigest()
+    log = WORK / "bench-stderr.txt"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    arguments = [str(folder / EXE), "--host", "127.0.0.1", "--port", str(port),
+                 "--model", str(Path(args.model).resolve()), "--vad-model", str(Path(args.vad_model).resolve())]
+    if args.no_gpu:
+        arguments.append("--no-gpu")
+    started = time.time()
+    with open(log, "wb") as err:
+        server = subprocess.Popen(arguments, env={**server_env(folder), TOKEN_VARIABLE: token}, cwd=folder,
+                                  stdout=subprocess.DEVNULL, stderr=err)
+    try:
+        if not wait_listening(server, log, port, 600):
+            say(log.read_text(encoding="utf-8", errors="replace")[-3000:])
+            fail("the server did not start")
+        loaded = time.time() - started
+        sound = Path(args.wav).read_bytes()
+        began = time.time()
+        status, _, body = ask(port, "/inference", token=token, form=app_form(sound, True))
+        took = time.time() - began
+        try:
+            got = json.loads(body)
+        except ValueError:
+            got = {}
+        segments = got.get("segments") or [] if isinstance(got, dict) else []
+        duration = float(got.get("duration") or 0) if isinstance(got, dict) else 0.0
+        say(f"BENCH  {'cpu' if args.no_gpu else 'gpu'}  model {Path(args.model).name}  HTTP {status}  "
+            f"recording {duration:.1f} s  answer {took:.1f} s  (x{(duration / took) if took else 0:.1f} real time)  "
+            f"segments {len(segments)}  start {loaded:.1f} s")
+        report_log(log.read_text(encoding="utf-8", errors="replace"))
+        if status != 200:
+            fail(f"the request was answered HTTP {status}")
+    finally:
+        server.kill()
+        server.wait()
 
 
 # ---- Licences ----
@@ -661,7 +1056,7 @@ SOFTWARE.
 """
 
 
-def write_licenses(source, dest, runtime):
+def write_licenses(source, dest, runtime, variant):
     """The licence of everything that is in the package, from the sources
     themselves: a missing notice stops the build."""
     dest.mkdir(parents=True)
@@ -709,34 +1104,88 @@ def write_licenses(source, dest, runtime):
             "  unchanged from Visual Studio's redistributable folder and distributed",
             "  under Microsoft's terms for redistributable code.",
         ]
-    notes += [
-        "The Vulkan shaders inside ggml-vulkan are whisper.cpp's own, compiled by the",
-        "  Vulkan SDK's glslc at build time. Nothing of the SDK is in this package;",
-        "  the Vulkan loader (vulkan-1.dll) is the computer's own.",
-        "",
-    ]
+    if variant == "vulkan":
+        notes += [
+            "The Vulkan shaders inside ggml-vulkan are whisper.cpp's own, compiled by the",
+            "  Vulkan SDK's glslc at build time. Nothing of the SDK is in this package;",
+            "  the Vulkan loader (vulkan-1.dll) is the computer's own.",
+        ]
+    elif variant == "metal":
+        notes += [
+            "The Metal shaders inside libggml-metal are whisper.cpp's own, carried as",
+            "  source and compiled on the computer by its Metal framework when the server",
+            "  first starts. Metal and Accelerate are parts of macOS; nothing of Xcode is",
+            "  in this package.",
+        ]
+    notes.append("")
     (dest / "README.txt").write_text("\n".join(notes), encoding="utf-8", newline="\n")
 
 
 def write_zip(stage, dest):
     """Every file of `stage` at the top of the archive, in name order, with
-    one fixed time, so the same files give the same archive."""
+    one fixed time, so the same files give the same archive. The program's
+    mode is 0755 (read on macOS and Linux)."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for path in sorted(p for p in stage.rglob("*") if p.is_file()):
             info = zipfile.ZipInfo(path.relative_to(stage).as_posix(), date_time=(2020, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
+            if MACOS:
+                info.create_system = 3
             info.external_attr = (0o755 if path.name == EXE else 0o644) << 16
             archive.writestr(info, path.read_bytes(), compresslevel=9)
 
 
+def unpack(archive, dest):
+    """The archive as a person gets it: macOS's own `ditto` (it keeps the
+    modes), elsewhere Python's zipfile (the program made runnable on Linux)."""
+    shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True)
+    if MACOS:
+        run(["ditto", "-x", "-k", archive, dest])
+    else:
+        with zipfile.ZipFile(archive) as opened:
+            opened.extractall(dest)
+        if not WINDOWS:
+            (dest / EXE).chmod(0o755)
+    if not WINDOWS and not os.access(dest / EXE, os.X_OK):
+        fail(f"{EXE} is not runnable as unpacked from {archive.name}")
+    return dest
+
+
+def platform_name():
+    if WINDOWS:
+        return "win-x64"
+    if MACOS:
+        return "macos-arm64"
+    return "linux-x64"
+
+
+def archive_name(tag, variant, unfixed):
+    if unfixed:
+        return f"whisper-check-{tag}-{variant}-unfixed-{platform_name()}.zip"
+    if WINDOWS:
+        return f"whisper-runtime-{tag}-{variant}-x64.zip"
+    return f"whisper-runtime-{tag}-{variant}-{platform_name()}.zip"
+
+
 def cmd_build(args):
     started = time.time()
-    if platform.machine().lower() not in ("x86_64", "amd64"):
-        fail(f"only x64 is built here, this is {platform.machine()}")
+    machine = platform.machine().lower()
     variant = args.variant
-    if variant == "vulkan" and not WINDOWS:
-        fail("the Vulkan variant is built on Windows; use --variant cpu here")
+    if MACOS:
+        if machine != "arm64":
+            fail(f"macOS is built on arm64 only, this is {platform.machine()}")
+        if variant != "metal":
+            fail("on macOS only the metal variant is built")
+    else:
+        if machine not in ("x86_64", "amd64"):
+            fail(f"only x64 is built here, this is {platform.machine()}")
+        if variant == "metal":
+            fail("the metal variant is built on macOS arm64")
+        if variant == "vulkan" and not WINDOWS:
+            fail("the Vulkan variant is built on Windows; use --variant cpu here")
+    unfixed = bool(args.unfixed_library)
     tag = args.tag or os.environ.get("GITHUB_REF_NAME") or "dev"
     if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.\-]*", tag):
         fail(f"{tag!r} can't be a release's name")
@@ -749,7 +1198,7 @@ def cmd_build(args):
     say("== sources")
     archive = obtain(pin["whisper"], cache)
     source = extract(archive, WORK / "src")
-    apply_patch(source)
+    apply_patch(source, unfixed)
 
     env = dict(os.environ)
     options = list(CMAKE_OPTIONS)
@@ -761,6 +1210,8 @@ def cmd_build(args):
         options.append("-DGGML_VULKAN=ON")
     else:
         options.append("-DGGML_VULKAN=OFF")
+    if variant == "metal":
+        options += MACOS_OPTIONS
 
     say("== build")
     build = WORK / "build"
@@ -776,16 +1227,13 @@ def cmd_build(args):
     stage = WORK / "stage"
     shutil.rmtree(stage, ignore_errors=True)
     stage.mkdir(parents=True)
-    report = gather_windows(bin_dir, stage, variant) if WINDOWS else gather_unix(bin_dir, stage)
-    write_licenses(source, stage / "licenses", report["runtime"])
-
-    say("== the built server, asked")
-    # A real model, so the answers have words and times: never packaged.
-    model = obtain(pin["testModel"], cache)
-    problems = smoke(stage, model, source / "samples" / "jfk.wav",
-                     source / "models" / "for-tests-silero-v6.2.0-ggml.bin")
-    if problems:
-        fail(f"{len(problems)} check(s) of the built server failed")
+    if WINDOWS:
+        report = gather_windows(bin_dir, stage, variant)
+    elif MACOS:
+        report = gather_macos(bin_dir, stage, variant)
+    else:
+        report = gather_unix(bin_dir, stage)
+    write_licenses(source, stage / "licenses", report["runtime"] if "runtime" in report else [], variant)
 
     compiler = ""
     cache_file = build / "CMakeCache.txt"
@@ -796,9 +1244,11 @@ def cmd_build(args):
     info = {
         "tag": tag,
         "variant": variant,
-        "platform": "win-x64" if WINDOWS else "linux-x64",
+        "platform": platform_name(),
+        "unfixedLibrary": unfixed,
         "whisper": {k: pin["whisper"][k] for k in ("version", "tag", "url", "sha256")},
-        "patch": {"file": "patches/whisper-server.patch", "sha256": sha256(PATCH)},
+        "patch": {"file": "patches/whisper-server.patch", "sha256": sha256(PATCH),
+                  "applied": "the server part only" if unfixed else "whole"},
         "vulkanSdk": ({k: pin["vulkanSdk"][k] for k in ("version", "url", "sha256")} if variant == "vulkan" else None),
         "testModel": {k: pin["testModel"][k] for k in ("url", "sha256")},
         "cmakeOptions": options,
@@ -807,15 +1257,30 @@ def cmd_build(args):
         "depends": report,
         "files": files,
     }
+    if MACOS:
+        info["macos"] = {"deploymentTarget": MACOS_DEPLOYMENT_TARGET, **xcode_report()}
     (stage / "BUILD.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8", newline="\n")
 
-    name = f"whisper-runtime-{tag}-{variant}-x64.zip" if WINDOWS else f"whisper-runtime-{tag}-{variant}-linux-x64.zip"
+    name = archive_name(tag, variant, unfixed)
     dest = DIST / name
     write_zip(stage, dest)
     with zipfile.ZipFile(dest) as check:
         names = check.namelist()
         if EXE not in names or check.testzip() is not None:
             fail(f"{name} is not a good archive")
+
+    say("== the built server, asked (from the archive, unpacked into a fresh folder)")
+    unpacked = unpack(dest, WORK / "unpacked")
+    if sorted(p.relative_to(unpacked).as_posix() for p in unpacked.rglob("*") if p.is_file()) != sorted(list(files) + ["BUILD.json"]):
+        dest.unlink()
+        fail(f"{name} does not unpack to the files that were packed")
+    # A real model, so the answers have words and times: never packaged.
+    model = obtain(pin["testModel"], cache)
+    problems = smoke(unpacked, model, source / "samples" / "jfk.wav",
+                     source / "models" / "for-tests-silero-v6.2.0-ggml.bin")
+    if problems and not (unfixed and problems == [TIMES_LABEL]):
+        dest.unlink()
+    verdict(problems, unfixed, "CHECKS")
     say(f"PASS  {name}: {dest.stat().st_size} bytes, {len(names)} files, SHA-256 {sha256(dest)}")
     say(f"BUILD: PASS ({int(time.time() - started)} s)")
 
@@ -829,16 +1294,29 @@ def main():
     pin.add_argument("--cache", default=str(WORK / "sources"))
     pin.set_defaults(run=cmd_pin)
     build = commands.add_parser("build")
-    build.add_argument("--variant", choices=("vulkan", "cpu"), default="vulkan" if WINDOWS else "cpu")
+    build.add_argument("--variant", choices=("vulkan", "metal", "cpu"),
+                       default="vulkan" if WINDOWS else ("metal" if MACOS else "cpu"))
     build.add_argument("--tag")
     build.add_argument("--cache")
+    build.add_argument("--unfixed-library", action="store_true",
+                       help="a check build: the patch's server part only, never released")
     build.set_defaults(run=cmd_build)
     check = commands.add_parser("smoke")
     check.add_argument("--dir", required=True)
     check.add_argument("--model", required=True, help="a real ggml model, e.g. ggml-tiny.bin")
     check.add_argument("--vad-model", required=True, help="the voice detection's ggml model")
     check.add_argument("--wav", required=True)
+    check.add_argument("--want-gpu", choices=("metal", "vulkan"), help="a check that the server uses that GPU")
+    check.add_argument("--expect-times-fault", action="store_true",
+                       help="a check build: pass only when the check of the times fails; exit 3 if it does not")
     check.set_defaults(run=cmd_smoke)
+    bench = commands.add_parser("bench")
+    bench.add_argument("--dir", required=True)
+    bench.add_argument("--model", required=True)
+    bench.add_argument("--vad-model", required=True)
+    bench.add_argument("--wav", required=True)
+    bench.add_argument("--no-gpu", action="store_true")
+    bench.set_defaults(run=cmd_bench)
     args = parser.parse_args()
     args.run(args)
 

@@ -25,7 +25,7 @@
  std::function<void(int)> shutdown_handler;
  std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
  
-@@ -642,6 +660,16 @@
+@@ -651,6 +669,16 @@
          return 1;
      }
  
@@ -42,7 +42,7 @@
      if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1) {
          fprintf(stderr, "error: unknown language '%s'\n", params.language.c_str());
          whisper_print_usage(argc, argv, params, sparams);
-@@ -726,9 +754,27 @@
+@@ -735,9 +763,27 @@
      state.store(SERVER_STATE_READY);
  
  
@@ -73,7 +73,40 @@
  
      std::string const default_content = R"(
      <html>
-@@ -1160,48 +1206,9 @@
+@@ -1118,6 +1164,10 @@
+                     segment["tokens"].push_back(token.id);
+                     std::string word_text = whisper_full_get_token_text(ctx, i, j);
+                     int64_t word_t1 = token.t1;
++                    // [pbh] The token whose times the word takes, so they can be
++                    // read back mapped to the recording (see below).
++                    const int word_j0 = j;
++                    int word_j1 = j;
+ 
+                     while (j + 1 < n_tokens && utf8_trailing_bytes_needed(word_text) > 0) {
+                         const whisper_token_data next_token = whisper_full_get_token_data(ctx, i, j + 1);
+@@ -1131,14 +1181,19 @@
+                         word_text += whisper_full_get_token_text(ctx, i, j);
+                         if (next_token.t1 > -1) {
+                             word_t1 = next_token.t1;
++                            word_j1 = j;
+                         }
+                         total_logprob += next_token.plog;
+                     }
+ 
+                     json word = json{{"word", word_text}};
+                     if (!params.no_timestamps && params.token_timestamps) {
+-                        word["start"] = token.t0 * 0.01;
+-                        word["end"] = word_t1 * 0.01;
++                        // [pbh] A word's times on the recording's own clock, as a
++                        // segment's are: token.t0/t1 lie on the timeline voice
++                        // detection has cut, so after removed silence a word came
++                        // early by the silence removed. The library maps them.
++                        word["start"] = (token.t0 > -1 ? whisper_full_get_token_t0(ctx, i, word_j0) : token.t0) * 0.01;
++                        word["end"] = (word_t1 > -1 ? whisper_full_get_token_t1(ctx, i, word_j1) : word_t1) * 0.01;
+                         word["t_dtw"] = token.t_dtw;
+                     }
+                     word["probability"] = token.p;
+@@ -1172,48 +1227,9 @@
                              "application/json");
          }
      });
@@ -125,7 +158,7 @@
  
      svr->Get(sparams.request_path + "/health", [&](const Request &, Response &res){
          server_state current_state = state.load();
-@@ -1229,6 +1236,10 @@
+@@ -1241,6 +1257,10 @@
      });
  
      svr->set_error_handler([](const Request &req, Response &res) {
@@ -136,7 +169,7 @@
          if (res.status == 400) {
              res.set_content("Invalid request", "text/plain");
          } else if (res.status != 500) {
-@@ -1248,6 +1259,10 @@
+@@ -1260,6 +1280,10 @@
          return 1;
      }
  
@@ -149,7 +182,7 @@
  
 --- a/src/whisper.cpp
 +++ b/src/whisper.cpp
-@@ -7788,6 +7788,14 @@
+@@ -7962,6 +7962,14 @@
          }
          samples = vad_samples.data();
          n_samples = vad_samples.size();
@@ -164,7 +197,7 @@
      }
      return whisper_full_with_state(ctx, ctx->state, params, samples, n_samples);
  }
-@@ -7815,6 +7823,12 @@
+@@ -7989,6 +7997,12 @@
          }
          samples = vad_samples.data();
          n_samples = vad_samples.size();
