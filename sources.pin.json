@@ -8,11 +8,11 @@
     "bytes": 9626464
   },
   "vulkanSdk": {
-    "version": "1.4.363.0",
-    "url": "https://sdk.lunarg.com/sdk/download/1.4.363.0/windows/vulkansdk-windows-X64-1.4.363.0.exe",
-    "file": "vulkan-sdk-1.4.363.0-windows-x64.exe",
-    "sha256": "94a82d378f7a5e3e54c9db7d2fb7016af136e14ac0a18dbf0f2f67a36352d141",
-    "bytes": 303082720
+    "version": "1.4.363.1",
+    "url": "https://sdk.lunarg.com/sdk/download/1.4.363.1/windows/vulkansdk-windows-X64-1.4.363.1.exe",
+    "file": "vulkan-sdk-1.4.363.1-windows-x64.exe",
+    "sha256": "c02932bd9a968b22d404536108adaacac908c081cd6b0113f5bfefc523dd0a6a",
+    "bytes": 303066832
   },
   "testModel": {
     "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
