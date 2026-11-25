@@ -69,23 +69,10 @@ jobs:
         env:
           TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
         run: python3 build.py build --variant metal --tag "$TAG"
-      # A check build without the library's fix, never released: its checks
-      # pass only when the check of the times fails (decision 720's fault).
-      - name: Check build (the library unfixed)
-        shell: bash
-        env:
-          TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'dev' }}
-        run: python3 build.py build --variant metal --tag "$TAG" --unfixed-library
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: whisper-runtime-metal-macos-arm64
           path: dist/whisper-runtime-*-metal-macos-arm64.zip
-          if-no-files-found: error
-          retention-days: 14
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: whisper-check-metal-unfixed-macos-arm64
-          path: dist/whisper-check-*-metal-unfixed-macos-arm64.zip
           if-no-files-found: error
           retention-days: 14
 

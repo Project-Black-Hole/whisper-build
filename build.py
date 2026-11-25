@@ -4,7 +4,6 @@
     python build.py pin --whisper <tag> [--vulkan-sdk <version>|latest]
         Downloads the sources, hashes them and writes sources.pin.json.
     python build.py build [--variant vulkan|metal|cpu] [--tag <tag>]
-                          [--unfixed-library]
         Checks every source against its SHA-256, applies
         patches/whisper-server.patch, builds `whisper-server` with ggml's
         backends as loadable libraries (every CPU variant; Vulkan for the
@@ -16,19 +15,16 @@
         an answer must carry its times inside its segment. The archive is
         dist/whisper-runtime-<tag>-<variant>-<platform>.zip (Windows keeps
         its old name, whisper-runtime-<tag>-vulkan-x64.zip).
-        --unfixed-library: a check build, never released. The patch's server
-        part only (its src/whisper.cpp part is left out), written as
-        dist/whisper-check-<tag>-<variant>-unfixed-<platform>.zip; it passes
-        only when the check of the times fails and every other check passes.
     python build.py smoke --dir <folder> --model <ggml model>
                           --vad-model <ggml model> --wav <file>
                           [--want-gpu metal|vulkan] [--expect-times-fault]
         Runs the same checks against a server that is already built. The
         model must be a real one (the source's `for-tests` models say
         nothing, and the checks of the times need words). --want-gpu makes
-        "the server uses that GPU" a check. --expect-times-fault: as for a
-        check build; exit code 3 when the times are right after all (every
-        other check passed), so a caller can say the fault is not there.
+        "the server uses that GPU" a check. --expect-times-fault: for a
+        build of whisper.cpp before 1.9.6 without the old library fix; exit
+        code 3 when the times are right after all (every other check
+        passed), so a caller can say the fault is not there.
     python build.py bench --dir <folder> --model <ggml model>
                           --vad-model <ggml model> --wav <file> [--no-gpu]
         One request of the app's own form, timed; a report, no check.
@@ -68,9 +64,11 @@ WINDOWS = os.name == "nt"
 MACOS = sys.platform == "darwin"
 EXE = "whisper-server.exe" if WINDOWS else "whisper-server"
 TOKEN_VARIABLE = "PBH_WHISPER_TOKEN"
-# The patch's part in the library itself (the fix of the times); a check
-# build leaves it out.
+# The library itself. Since whisper.cpp 1.9.6 (its PR #4122) upstream clears
+# voice detection's state at the start of every request without it, in both
+# calls, so the patch no longer touches this file (decision 2990).
 LIBRARY_FILE = "src/whisper.cpp"
+UPSTREAM_CLEAR = "whisper_state_clear_vad(ctx->state);"
 
 # The Visual C++ runtime's libraries: never taken from the system folder of
 # the machine that builds, always from the compiler's own redistributable
@@ -290,17 +288,17 @@ def run(command, env=None, cwd=None):
         fail(f"{Path(str(command[0])).name} ended with {result.returncode}")
 
 
-def apply_patch(source, unfixed=False):
+def apply_patch(source):
     """The patch must apply whole and exactly: `git apply` refuses a hunk
-    that does not match, with no fuzz. A check build applies its server part
-    only: the library's part is left out here, the file is not split."""
-    leave_out = ["--exclude", LIBRARY_FILE] if unfixed else []
+    that does not match, with no fuzz. It changes the server only."""
+    if f"--- a/{LIBRARY_FILE}" in PATCH.read_text(encoding="utf-8"):
+        fail(f"the patch changes {LIBRARY_FILE}: since 1.9.6 the library is upstream's")
     # Git must not see the repository this script sits in (a checkout, on the
     # runners): inside one, `git apply` takes the patch's paths from the
     # repository's top and `--exclude` matches nothing.
     env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(Path(source).resolve().parent))
-    run(["git", "apply", "--check", "--verbose"] + leave_out + [PATCH], env=env, cwd=source)
-    run(["git", "apply", "--verbose"] + leave_out + [PATCH], env=env, cwd=source)
+    run(["git", "apply", "--check", "--verbose", PATCH], env=env, cwd=source)
+    run(["git", "apply", "--verbose", PATCH], env=env, cwd=source)
     patched = (source / "examples" / "server" / "server.cpp").read_text(encoding="utf-8")
     for must in (TOKEN_VARIABLE, "set_pre_routing_handler", "[pbh] listening on",
                  "whisper_full_get_token_t0(ctx, i, word_j0)", "whisper_full_get_token_t1(ctx, i, word_j1)"):
@@ -308,18 +306,16 @@ def apply_patch(source, unfixed=False):
             fail(f"the patched server.cpp does not hold {must!r}")
     if 'request_path + "/load"' in patched or "Access-Control-Allow-Origin" in patched:
         fail("the patched server.cpp still has /load or a cross-origin header")
-    # Upstream clears the table once (inside whisper_vad); the patch adds a
-    # place for each of the two calls that can run without voice detection.
-    library = (source / "src" / "whisper.cpp").read_text(encoding="utf-8")
-    cleared = library.count("state->vad_mapping_table.clear();")
-    if unfixed:
-        if library.count("[pbh]") != 0:
-            fail("the check build's whisper.cpp holds a [pbh] place: the library's part was applied")
-        say(f"PASS  the patch's server part applied; the library is upstream's ({cleared} place(s) clear the time table): a check build")
-        return
-    if library.count("[pbh]") != 2 or cleared < 4:
-        fail(f"the patched whisper.cpp does not clear the voice detection's time table in both calls ({cleared} place(s))")
-    say("PASS  the patch applied: token, Origin refusal, no /load, no cross-origin headers, words' times mapped to the recording, no time table kept from an earlier request")
+    # Upstream (1.9.6) clears voice detection's state at the start of each of
+    # the two calls that can run without it; the built server's check of the
+    # times below is the proof on the program itself.
+    library = (source / LIBRARY_FILE).read_text(encoding="utf-8")
+    cleared = library.count(UPSTREAM_CLEAR)
+    if library.count("[pbh]") != 0:
+        fail(f"{LIBRARY_FILE} holds a [pbh] place: the library must be upstream's")
+    if cleared != 2:
+        fail(f"upstream's {LIBRARY_FILE} does not clear voice detection's state in both calls ({cleared} place(s) of {UPSTREAM_CLEAR!r}, 2 wanted)")
+    say("PASS  the patch applied: token, Origin refusal, no /load, no cross-origin headers, words' times mapped to the recording; the library is upstream's and clears voice detection's state in both calls")
 
 
 def install_vulkan_sdk(entry, cache):
@@ -1164,9 +1160,7 @@ def platform_name():
     return "linux-x64"
 
 
-def archive_name(tag, variant, unfixed):
-    if unfixed:
-        return f"whisper-check-{tag}-{variant}-unfixed-{platform_name()}.zip"
+def archive_name(tag, variant):
     if WINDOWS:
         return f"whisper-runtime-{tag}-{variant}-x64.zip"
     return f"whisper-runtime-{tag}-{variant}-{platform_name()}.zip"
@@ -1188,7 +1182,6 @@ def cmd_build(args):
             fail("the metal variant is built on macOS arm64")
         if variant == "vulkan" and not WINDOWS:
             fail("the Vulkan variant is built on Windows; use --variant cpu here")
-    unfixed = bool(args.unfixed_library)
     tag = args.tag or os.environ.get("GITHUB_REF_NAME") or "dev"
     if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.\-]*", tag):
         fail(f"{tag!r} can't be a release's name")
@@ -1201,7 +1194,7 @@ def cmd_build(args):
     say("== sources")
     archive = obtain(pin["whisper"], cache)
     source = extract(archive, WORK / "src")
-    apply_patch(source, unfixed)
+    apply_patch(source)
 
     env = dict(os.environ)
     options = list(CMAKE_OPTIONS)
@@ -1248,10 +1241,9 @@ def cmd_build(args):
         "tag": tag,
         "variant": variant,
         "platform": platform_name(),
-        "unfixedLibrary": unfixed,
         "whisper": {k: pin["whisper"][k] for k in ("version", "tag", "url", "sha256")},
         "patch": {"file": "patches/whisper-server.patch", "sha256": sha256(PATCH),
-                  "applied": "the server part only" if unfixed else "whole"},
+                  "applied": "whole"},
         "vulkanSdk": ({k: pin["vulkanSdk"][k] for k in ("version", "url", "sha256")} if variant == "vulkan" else None),
         "testModel": {k: pin["testModel"][k] for k in ("url", "sha256")},
         "cmakeOptions": options,
@@ -1264,7 +1256,7 @@ def cmd_build(args):
         info["macos"] = {"deploymentTarget": MACOS_DEPLOYMENT_TARGET, **xcode_report()}
     (stage / "BUILD.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8", newline="\n")
 
-    name = archive_name(tag, variant, unfixed)
+    name = archive_name(tag, variant)
     dest = DIST / name
     write_zip(stage, dest)
     with zipfile.ZipFile(dest) as check:
@@ -1281,9 +1273,9 @@ def cmd_build(args):
     model = obtain(pin["testModel"], cache)
     problems = smoke(unpacked, model, source / "samples" / "jfk.wav",
                      source / "models" / "for-tests-silero-v6.2.0-ggml.bin")
-    if problems and not (unfixed and problems == [TIMES_LABEL]):
+    if problems:
         dest.unlink()
-    verdict(problems, unfixed, "CHECKS")
+    verdict(problems, False, "CHECKS")
     say(f"PASS  {name}: {dest.stat().st_size} bytes, {len(names)} files, SHA-256 {sha256(dest)}")
     say(f"BUILD: PASS ({int(time.time() - started)} s)")
 
@@ -1301,8 +1293,6 @@ def main():
                        default="vulkan" if WINDOWS else ("metal" if MACOS else "cpu"))
     build.add_argument("--tag")
     build.add_argument("--cache")
-    build.add_argument("--unfixed-library", action="store_true",
-                       help="a check build: the patch's server part only, never released")
     build.set_defaults(run=cmd_build)
     check = commands.add_parser("smoke")
     check.add_argument("--dir", required=True)
@@ -1311,7 +1301,7 @@ def main():
     check.add_argument("--wav", required=True)
     check.add_argument("--want-gpu", choices=("metal", "vulkan"), help="a check that the server uses that GPU")
     check.add_argument("--expect-times-fault", action="store_true",
-                       help="a check build: pass only when the check of the times fails; exit 3 if it does not")
+                       help="a build before 1.9.6 without the old library fix: pass only when the check of the times fails; exit 3 if it does not")
     check.set_defaults(run=cmd_smoke)
     bench = commands.add_parser("bench")
     bench.add_argument("--dir", required=True)

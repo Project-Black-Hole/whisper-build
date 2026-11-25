@@ -59,9 +59,6 @@ folder before the first start:
 xattr -dr com.apple.quarantine <folder>
 ```
 
-A check build, `whisper-check-<tag>-metal-unfixed-macos-arm64.zip`, is kept
-as a workflow artifact for 14 days and never released (below).
-
 ## The patch
 
 Upstream's server is made to be reached by anything on the computer: it has
@@ -87,16 +84,15 @@ it:
   removed, outside its own segment. The patch writes them through the
   library's own mapping (`whisper_full_get_token_t0` and `_t1`).
 
-It also mends one fault of the library itself (`src/whisper.cpp`):
-
-- **A request's times are its own.** Upstream keeps the time table of the
-  last request that had voice detection on, and clears it only when the
-  next request has voice detection on too. A request without voice
-  detection that followed one with it had its segments' times mapped
-  through the earlier recording's table: late by however much silence that
-  recording had lost, and past the end of its own sound. The patch clears
-  the table, the detected stretches and their flag at the start of every
-  request without voice detection.
+**A request's times are its own.** Before whisper.cpp 1.9.6 the library
+kept the time table of the last request that had voice detection on, so a
+request without it that followed one with it had its segments' times mapped
+through the earlier recording's table (late by the silence that recording
+had lost). This patch mended it in the library until 1.9.6; since 1.9.6
+(whisper.cpp's PR #4122) upstream clears that state at the start of every
+request without voice detection, in both calls, and the patch changes the
+server only. `build.py` refuses a library that holds a `[pbh]` place or
+does not clear it in both calls.
 
 Every changed place is marked `[pbh]` in the source. `build.py` refuses a
 patch that does not apply exactly, and checks each of the points above
@@ -112,12 +108,12 @@ recording and for the recording with the silence before it, and every
 segment of each answer must carry `words`, each with a start no later than
 its end, inside its segment.
 
-**The check build** (`build.py build --unfixed-library`) applies the patch's
-server part only and leaves the library as upstream has it. Its checks pass
-only when the check of the times fails and every other check passes, so
-every build shows that the check would catch the fault. `build.py smoke
---expect-times-fault` asks an unpacked check build the same way (exit code
-3: the times were right after all).
+**The check build** of the releases before 1.9.6 (`--unfixed-library`, the
+library without the old fix) is gone with that fix: its checks passed only
+when the check of the times failed, and on 1.9.6 they would not. The check
+of the times stays in every build. `build.py smoke --expect-times-fault`
+still asks an unpacked build of an older whisper.cpp that way (exit code 3:
+the times were right after all).
 
 ## Moving a pin
 

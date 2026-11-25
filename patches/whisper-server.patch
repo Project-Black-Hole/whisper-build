@@ -1,6 +1,6 @@
 --- a/examples/server/server.cpp
 +++ b/examples/server/server.cpp
-@@ -40,6 +40,24 @@
+@@ -40,6 +40,24 @@ const std::string srt_format    = "srt";
  const std::string vjson_format  = "verbose_json";
  const std::string vtt_format    = "vtt";
  
@@ -25,7 +25,7 @@
  std::function<void(int)> shutdown_handler;
  std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
  
-@@ -651,6 +669,16 @@
+@@ -656,6 +674,16 @@ int main(int argc, char ** argv) {
          return 1;
      }
  
@@ -42,7 +42,7 @@
      if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1) {
          fprintf(stderr, "error: unknown language '%s'\n", params.language.c_str());
          whisper_print_usage(argc, argv, params, sparams);
-@@ -735,9 +763,27 @@
+@@ -740,9 +768,27 @@ int main(int argc, char ** argv) {
      state.store(SERVER_STATE_READY);
  
  
@@ -73,7 +73,7 @@
  
      std::string const default_content = R"(
      <html>
-@@ -1118,6 +1164,10 @@
+@@ -1129,6 +1175,10 @@ int main(int argc, char ** argv) {
                      segment["tokens"].push_back(token.id);
                      std::string word_text = whisper_full_get_token_text(ctx, i, j);
                      int64_t word_t1 = token.t1;
@@ -84,7 +84,7 @@
  
                      while (j + 1 < n_tokens && utf8_trailing_bytes_needed(word_text) > 0) {
                          const whisper_token_data next_token = whisper_full_get_token_data(ctx, i, j + 1);
-@@ -1131,14 +1181,19 @@
+@@ -1142,14 +1192,19 @@ int main(int argc, char ** argv) {
                          word_text += whisper_full_get_token_text(ctx, i, j);
                          if (next_token.t1 > -1) {
                              word_t1 = next_token.t1;
@@ -106,7 +106,7 @@
                          word["t_dtw"] = token.t_dtw;
                      }
                      word["probability"] = token.p;
-@@ -1172,48 +1227,9 @@
+@@ -1183,48 +1238,9 @@ int main(int argc, char ** argv) {
                              "application/json");
          }
      });
@@ -158,7 +158,7 @@
  
      svr->Get(sparams.request_path + "/health", [&](const Request &, Response &res){
          server_state current_state = state.load();
-@@ -1241,6 +1257,10 @@
+@@ -1252,6 +1268,10 @@ int main(int argc, char ** argv) {
      });
  
      svr->set_error_handler([](const Request &req, Response &res) {
@@ -169,7 +169,7 @@
          if (res.status == 400) {
              res.set_content("Invalid request", "text/plain");
          } else if (res.status != 500) {
-@@ -1260,6 +1280,10 @@
+@@ -1288,6 +1308,10 @@ int main(int argc, char ** argv) {
          return 1;
      }
  
@@ -179,34 +179,4 @@
 +
      // Set the base directory for serving static files
      svr->set_base_dir(sparams.public_path);
- 
---- a/src/whisper.cpp
-+++ b/src/whisper.cpp
-@@ -7962,6 +7962,14 @@
-         }
-         samples = vad_samples.data();
-         n_samples = vad_samples.size();
-+    } else {
-+        // [pbh] Without voice detection nothing of an earlier call's may
-+        // stay: upstream clears its time table only inside whisper_vad(), so
-+        // a call without voice detection that follows one with it had its
-+        // segments' times mapped through the earlier recording's table.
-+        ctx->state->has_vad_segments = false;
-+        ctx->state->vad_mapping_table.clear();
-+        ctx->state->vad_segments.clear();
-     }
-     return whisper_full_with_state(ctx, ctx->state, params, samples, n_samples);
- }
-@@ -7989,6 +7997,12 @@
-         }
-         samples = vad_samples.data();
-         n_samples = vad_samples.size();
-+    } else {
-+        // [pbh] As in whisper_full(): nothing of an earlier call's voice
-+        // detection stays for a call without it.
-+        ctx->state->has_vad_segments = false;
-+        ctx->state->vad_mapping_table.clear();
-+        ctx->state->vad_segments.clear();
-     }
-     int ret = 0;
  
